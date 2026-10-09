@@ -1,24 +1,192 @@
 use super::*;
-use std::cell::Cell;
+
+// The C runtime's character classes for the "C" locale, as Microsoft's runtime returns them:
+// _UPPER 0x1, _LOWER 0x2, _DIGIT 0x4, _SPACE 0x8, _PUNCT 0x10, _CONTROL 0x20, _BLANK 0x40, _HEX 0x80,
+// _ALPHA 0x100. The is* functions return the class bits they test, not just non-zero, and callers
+// can keep only the low byte, so glibc's values, which use other bits, read as false there.
+fn ctype(c: i32) -> i32 {
+    match c {
+        0x41..=0x46 => 0x181,
+        0x47..=0x5A => 0x101,
+        0x61..=0x66 => 0x182,
+        0x67..=0x7A => 0x102,
+        0x30..=0x39 => 0x84,
+        0x20 => 0x48,
+        0x09 => 0x68,
+        0x0A..=0x0D => 0x28,
+        0x00..=0x08 | 0x0E..=0x1F | 0x7F => 0x20,
+        0x21..=0x2F | 0x3A..=0x40 | 0x5B..=0x60 | 0x7B..=0x7E => 0x10,
+        _ => 0,
+    }
+}
 
 // ============ msvcrt - memory ============
 
 static ERRNO_VAL: AtomicU32 = AtomicU32::new(0);
 
-// Comparator wrapper for qsort/bsearch - translates C calling convention to win64
 type Win64Comparator = unsafe extern "win64" fn(*const c_void, *const c_void) -> i32;
 
-thread_local! {
-    static QSORT_COMPARATOR: Cell<Option<Win64Comparator>> = const { Cell::new(None) };
+unsafe fn swap_elements(a: *mut u8, b: *mut u8, width: usize) {
+    if a != b {
+        std::ptr::swap_nonoverlapping(a, b, width);
+    }
 }
 
-unsafe extern "C" fn qsort_wrapper(a: *const c_void, b: *const c_void) -> i32 {
-    QSORT_COMPARATOR.with(|cmp| {
-        let f = cmp
-            .get()
-            .expect("qsort_wrapper called without comparator set");
-        f(a, b)
-    })
+// The Microsoft C runtime's qsort: a quicksort on the median of three, with a selection sort below
+// nine elements. It is not stable, and the order it leaves equal elements in is its own, which the
+// output of a compiler that sorts with it can depend on.
+unsafe fn ms_qsort(base: *mut u8, num: usize, width: usize, comp: Win64Comparator) {
+    const CUTOFF: usize = 8;
+    if num < 2 || width == 0 {
+        return;
+    }
+    let cmp = |a: *mut u8, b: *mut u8| comp(a as *const c_void, b as *const c_void);
+    let mut stack: Vec<(*mut u8, *mut u8)> = Vec::new();
+    let (mut lo, mut hi) = (base, base.add(width * (num - 1)));
+    loop {
+        let size = (hi as usize - lo as usize) / width + 1;
+        if size <= CUTOFF {
+            // repeatedly move the largest remaining element to the end
+            let mut end = hi;
+            while end > lo {
+                let mut max = lo;
+                let mut p = lo.add(width);
+                while p <= end {
+                    if cmp(p, max) > 0 {
+                        max = p;
+                    }
+                    p = p.add(width);
+                }
+                swap_elements(max, end, width);
+                end = end.sub(width);
+            }
+        } else {
+            let mut mid = lo.add((size / 2) * width);
+            if cmp(lo, mid) > 0 {
+                swap_elements(lo, mid, width);
+            }
+            if cmp(lo, hi) > 0 {
+                swap_elements(lo, hi, width);
+            }
+            if cmp(mid, hi) > 0 {
+                swap_elements(mid, hi, width);
+            }
+            let (mut loguy, mut higuy) = (lo, hi);
+            loop {
+                if mid > loguy {
+                    loop {
+                        loguy = loguy.add(width);
+                        if !(loguy < mid && cmp(loguy, mid) <= 0) {
+                            break;
+                        }
+                    }
+                }
+                if mid <= loguy {
+                    loop {
+                        loguy = loguy.add(width);
+                        if !(loguy <= hi && cmp(loguy, mid) <= 0) {
+                            break;
+                        }
+                    }
+                }
+                loop {
+                    higuy = higuy.sub(width);
+                    if !(higuy > mid && cmp(higuy, mid) > 0) {
+                        break;
+                    }
+                }
+                if higuy < loguy {
+                    break;
+                }
+                swap_elements(loguy, higuy, width);
+                if mid == higuy {
+                    mid = loguy;
+                }
+            }
+            higuy = higuy.add(width);
+            if mid < higuy {
+                loop {
+                    higuy = higuy.sub(width);
+                    if !(higuy > mid && cmp(higuy, mid) == 0) {
+                        break;
+                    }
+                }
+            }
+            if mid >= higuy {
+                loop {
+                    higuy = higuy.sub(width);
+                    if !(higuy > lo && cmp(higuy, mid) == 0) {
+                        break;
+                    }
+                }
+            }
+            // sort the smaller part next and keep the larger for later
+            if higuy as usize - lo as usize >= hi as usize - loguy as usize {
+                if lo < higuy {
+                    stack.push((lo, higuy));
+                }
+                if loguy < hi {
+                    lo = loguy;
+                    continue;
+                }
+            } else {
+                if loguy < hi {
+                    stack.push((loguy, hi));
+                }
+                if lo < higuy {
+                    hi = higuy;
+                    continue;
+                }
+            }
+        }
+        match stack.pop() {
+            Some((l, h)) => (lo, hi) = (l, h),
+            None => return,
+        }
+    }
+}
+
+// The Microsoft C runtime's bsearch, which finds the same one of several equal elements it does
+unsafe fn ms_bsearch(
+    key: *const c_void,
+    base: *const u8,
+    mut num: usize,
+    width: usize,
+    comp: Win64Comparator,
+) -> *mut c_void {
+    if num == 0 {
+        return std::ptr::null_mut();
+    }
+    let mut lo = base;
+    let mut hi = base.add((num - 1) * width);
+    while lo <= hi {
+        let half = num / 2;
+        if half != 0 {
+            let mid = lo.add(if num & 1 != 0 { half } else { half - 1 } * width);
+            let result = comp(key, mid as *const c_void);
+            if result == 0 {
+                return mid as *mut c_void;
+            } else if result < 0 {
+                if mid == base {
+                    break;
+                }
+                hi = mid.sub(width);
+                num = if num & 1 != 0 { half } else { half - 1 };
+            } else {
+                lo = mid.add(width);
+                num = half;
+            }
+        } else if num != 0 {
+            return if comp(key, lo as *const c_void) != 0 {
+                std::ptr::null_mut()
+            } else {
+                lo as *mut c_void
+            };
+        } else {
+            break;
+        }
+    }
+    std::ptr::null_mut()
 }
 
 import_fn! {
@@ -168,6 +336,11 @@ import_fn! {
         libc::strstr(haystack, needle)
     }
 
+    fn strlen(s: *const i8) -> usize {
+        trace_call!("msvcrt!strlen");
+        libc::strlen(s)
+    }
+
     fn strnlen(s: *const i8, max_len: usize) -> usize {
         trace_call!("msvcrt!strnlen");
         libc::strnlen(s, max_len)
@@ -210,17 +383,19 @@ import_fn! {
 
     fn isalnum(c: i32) -> i32 {
         trace_call!("msvcrt!isalnum");
-        libc::isalnum(c)
+        ctype(c) & 0x107
     }
 
     fn isalpha(c: i32) -> i32 {
-        trace_call!("msvcrt!isalpha");
-        libc::isalpha(c)
+        let r = ctype(c) & 0x103;
+        trace_call!("msvcrt!isalpha", "c=0x{:x} -> 0x{:x}", c, r);
+        r
     }
 
     fn isdigit(c: i32) -> i32 {
-        trace_call!("msvcrt!isdigit");
-        libc::isdigit(c)
+        let r = ctype(c) & 0x4;
+        trace_call!("msvcrt!isdigit", "c=0x{:x} -> 0x{:x}", c, r);
+        r
     }
 
     fn iswdigit(c: u16) -> i32 {
@@ -230,12 +405,12 @@ import_fn! {
 
     fn isspace(c: i32) -> i32 {
         trace_call!("msvcrt!isspace");
-        libc::isspace(c)
+        ctype(c) & 0x8
     }
 
     fn isxdigit(c: i32) -> i32 {
         trace_call!("msvcrt!isxdigit");
-        libc::isxdigit(c)
+        ctype(c) & 0x80
     }
 
     fn __isascii(c: i32) -> i32 {
@@ -733,18 +908,22 @@ import_fn! {
         }
     }
 
+    // _FPCLASS_SNAN 0x1, QNAN 0x2, NINF 0x4, NN 0x8, ND 0x10, NZ 0x20, PZ 0x40, PD 0x80, PN 0x100,
+    // PINF 0x200: sign, zero and denormal all count
     fn _fpclass(x: f64) -> i32 {
         trace_call!("msvcrt!_fpclass");
+        let negative = x.is_sign_negative();
         if x.is_nan() {
-            0x0002
+            // a quiet NaN has the top bit of the mantissa set
+            if x.to_bits() & (1 << 51) != 0 { 0x0002 } else { 0x0001 }
         } else if x.is_infinite() {
-            if x > 0.0 {
-                0x0200
-            } else {
-                0x0004
-            }
+            if negative { 0x0004 } else { 0x0200 }
         } else if x == 0.0 {
-            0x0020
+            if negative { 0x0020 } else { 0x0040 }
+        } else if x.is_subnormal() {
+            if negative { 0x0010 } else { 0x0080 }
+        } else if negative {
+            0x0008
         } else {
             0x0100
         }
@@ -818,10 +997,7 @@ import_fn! {
         compar: *const c_void,
     ) {
         trace_call!("msvcrt!qsort", "num={}, size={}", num, size);
-        let win64_cmp: Win64Comparator = std::mem::transmute(compar);
-        QSORT_COMPARATOR.with(|cmp| cmp.set(Some(win64_cmp)));
-        libc::qsort(base, num, size, Some(qsort_wrapper));
-        QSORT_COMPARATOR.with(|cmp| cmp.set(None));
+        ms_qsort(base as *mut u8, num, size, std::mem::transmute::<*const c_void, Win64Comparator>(compar));
     }
 
     fn bsearch(
@@ -832,11 +1008,7 @@ import_fn! {
         compar: *const c_void,
     ) -> *mut c_void {
         trace_call!("msvcrt!bsearch", "num={}, size={}", num, size);
-        let win64_cmp: Win64Comparator = std::mem::transmute(compar);
-        QSORT_COMPARATOR.with(|cmp| cmp.set(Some(win64_cmp)));
-        let result = libc::bsearch(key, base, num, size, Some(qsort_wrapper));
-        QSORT_COMPARATOR.with(|cmp| cmp.set(None));
-        result
+        ms_bsearch(key, base as *const u8, num, size, std::mem::transmute::<*const c_void, Win64Comparator>(compar))
     }
 
     fn getenv(name: *const i8) -> *mut i8 {
@@ -1055,7 +1227,18 @@ unsafe extern "win64" fn sprintf_s_impl(
     argptr: *const u64,
 ) -> i32 {
     trace_call!("msvcrt!sprintf_s");
-    super::printf::vsnprintf_core(buffer, size, format, argptr)
+    // Text that does not fit is an invalid parameter: the buffer is emptied and -1 returned
+    let text = super::printf::format(format, argptr);
+    if buffer.is_null() || size == 0 {
+        return -1;
+    }
+    if text.len() >= size {
+        *buffer = 0;
+        return -1;
+    }
+    std::ptr::copy_nonoverlapping(text.as_ptr(), buffer as *mut u8, text.len());
+    *buffer.add(text.len()) = 0;
+    text.len() as i32
 }
 
 #[unsafe(naked)]

@@ -10,6 +10,7 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::missing_transmute_annotations)]
 #![allow(unsafe_op_in_unsafe_fn)]
+#![recursion_limit = "256"]
 
 mod imports;
 
@@ -1371,7 +1372,7 @@ mod linux_loader {
             "_memicmp" => imports::msvcrt::_memicmp as *const () as usize,
 
             // string
-            "strlen" => libc::strlen as *const () as usize,
+            "strlen" => imports::msvcrt::strlen as *const () as usize,
             "strcmp" => imports::msvcrt::strcmp as *const () as usize,
             "strncmp" => imports::msvcrt::strncmp as *const () as usize,
             "strcpy_s" => imports::msvcrt::strcpy_s as *const () as usize,
